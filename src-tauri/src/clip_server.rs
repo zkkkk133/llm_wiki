@@ -1,11 +1,16 @@
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server};
 
 static CURRENT_PROJECT: Mutex<String> = Mutex::new(String::new());
 static ALL_PROJECTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (name, path)
 static PENDING_CLIPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (projectPath, filePath)
+static PENDING_ASKS: Mutex<Vec<PendingAsk>> = Mutex::new(Vec::new());
+static ASK_RESULTS: Mutex<Vec<AskResult>> = Mutex::new(Vec::new());
+static ASK_RESULTS_CVAR: Condvar = Condvar::new();
+static ASK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Daemon status: 0=starting, 1=running, 2=port_conflict, 3=error
 static DAEMON_STATUS: AtomicU8 = AtomicU8::new(0);
@@ -15,6 +20,21 @@ const MAX_BIND_RETRIES: u32 = 3;
 const MAX_RESTART_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY_SECS: u64 = 2;
 const RESTART_DELAY_SECS: u64 = 5;
+const DEFAULT_ASK_TIMEOUT_MS: u64 = 300_000;
+const MAX_ASK_TIMEOUT_MS: u64 = 1_800_000;
+
+#[derive(Clone)]
+struct PendingAsk {
+    id: String,
+    project_path: String,
+    question: String,
+}
+
+struct AskResult {
+    id: String,
+    status: u16,
+    body: String,
+}
 
 /// Get current daemon status as a string
 pub fn get_daemon_status() -> &'static str {
@@ -203,6 +223,76 @@ pub fn start_clip_server() {
                     for h in &cors_headers { response.add_header(h.clone()); }
                     let _ = request.respond(response);
                 }
+                (&Method::Get, "/asks/pending") => {
+                    let mut pending = PENDING_ASKS.lock().unwrap();
+                    let asks_json: Vec<serde_json::Value> = pending.iter()
+                        .map(|ask| serde_json::json!({
+                            "id": ask.id,
+                            "projectPath": ask.project_path,
+                            "question": ask.question,
+                        }))
+                        .collect();
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "asks": asks_json,
+                    }).to_string();
+                    pending.clear();
+                    let mut response = Response::from_string(body);
+                    for h in &cors_headers { response.add_header(h.clone()); }
+                    let _ = request.respond(response);
+                }
+                (&Method::Post, "/asks/answer") => {
+                    let mut body = String::new();
+                    if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                        let err =
+                            format!(r#"{{"ok":false,"error":"Failed to read body: {}"}}"#, e);
+                        let mut response = Response::from_string(err).with_status_code(400);
+                        for h in &cors_headers {
+                            response.add_header(h.clone());
+                        }
+                        let _ = request.respond(response);
+                        continue;
+                    }
+
+                    let result = handle_ask_answer(&body);
+                    let status = if result.contains(r#""ok":true"#) {
+                        200
+                    } else {
+                        400
+                    };
+                    let mut response = Response::from_string(result).with_status_code(status);
+                    for h in &cors_headers {
+                        response.add_header(h.clone());
+                    }
+                    let _ = request.respond(response);
+                }
+                (&Method::Post, "/ask") => {
+                    let mut body = String::new();
+                    if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                        let err =
+                            format!(r#"{{"ok":false,"error":"Failed to read body: {}"}}"#, e);
+                        let mut response = Response::from_string(err).with_status_code(400);
+                        for h in &cors_headers {
+                            response.add_header(h.clone());
+                        }
+                        let _ = request.respond(response);
+                        continue;
+                    }
+
+                    // Keep the tiny_http accept loop free while a question is
+                    // being answered. The frontend has to poll /asks/pending
+                    // and POST /asks/answer on this same server, so blocking
+                    // in the accept loop would deadlock the request.
+                    let response_headers = cors_headers.clone();
+                    thread::spawn(move || {
+                        let (result, status) = handle_ask(&body);
+                        let mut response = Response::from_string(result).with_status_code(status);
+                        for h in &response_headers {
+                            response.add_header(h.clone());
+                        }
+                        let _ = request.respond(response);
+                    });
+                }
                 (&Method::Post, "/clip") => {
                     let mut body = String::new();
                     if let Err(e) = request.as_reader().read_to_string(&mut body) {
@@ -279,6 +369,187 @@ fn handle_set_project(body: &str) -> String {
             r#"{"ok":true}"#.to_string()
         }
         Err(e) => format!(r#"{{"ok":false,"error":"Lock error: {}"}}"#, e),
+    }
+}
+
+fn handle_ask(body: &str) -> (String, u16) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}).to_string(),
+                400,
+            )
+        }
+    };
+
+    let question = match parsed["question"].as_str() {
+        Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+        _ => {
+            return (
+                serde_json::json!({"ok": false, "error": "question field is required"}).to_string(),
+                400,
+            )
+        }
+    };
+
+    let project_path_from_body = parsed["projectPath"].as_str().unwrap_or("").to_string();
+    let project_path = if project_path_from_body.is_empty() {
+        match CURRENT_PROJECT.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                return (
+                    serde_json::json!({"ok": false, "error": format!("Lock error: {}", e)}).to_string(),
+                    500,
+                )
+            }
+        }
+    } else {
+        project_path_from_body
+    };
+    let project_path = project_path.replace('\\', "/");
+
+    if project_path.is_empty() {
+        return (
+            serde_json::json!({
+                "ok": false,
+                "error": "projectPath is required (set via POST /project or include in request body)",
+            })
+            .to_string(),
+            400,
+        );
+    }
+
+    let timeout_ms = parsed["timeoutMs"]
+        .as_u64()
+        .unwrap_or(DEFAULT_ASK_TIMEOUT_MS)
+        .clamp(1_000, MAX_ASK_TIMEOUT_MS);
+
+    let id = format!(
+        "ask_{}_{}",
+        chrono::Local::now().timestamp_millis(),
+        ASK_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    match PENDING_ASKS.lock() {
+        Ok(mut pending) => pending.push(PendingAsk {
+            id: id.clone(),
+            project_path,
+            question,
+        }),
+        Err(e) => {
+            return (
+                serde_json::json!({"ok": false, "error": format!("Lock error: {}", e)}).to_string(),
+                500,
+            )
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut results = match ASK_RESULTS.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            remove_pending_ask(&id);
+            return (
+                serde_json::json!({"ok": false, "id": id, "error": format!("Lock error: {}", e)}).to_string(),
+                500,
+            );
+        }
+    };
+
+    loop {
+        if let Some(pos) = results.iter().position(|result| result.id == id) {
+            let result = results.remove(pos);
+            return (result.body, result.status);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            remove_pending_ask(&id);
+            return (
+                serde_json::json!({
+                    "ok": false,
+                    "id": id,
+                    "error": "Timed out waiting for the desktop app to answer. Make sure LLM Wiki is open and an LLM provider is configured.",
+                })
+                .to_string(),
+                504,
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let waited = ASK_RESULTS_CVAR.wait_timeout(results, remaining);
+        match waited {
+            Ok((guard, _)) => results = guard,
+            Err(e) => {
+                remove_pending_ask(&id);
+                return (
+                    serde_json::json!({"ok": false, "id": id, "error": format!("Lock error: {}", e)}).to_string(),
+                    500,
+                );
+            }
+        }
+    }
+}
+
+fn handle_ask_answer(body: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return format!(r#"{{"ok":false,"error":"Invalid JSON: {}"}}"#, e),
+    };
+
+    let id = match parsed["id"].as_str() {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => return r#"{"ok":false,"error":"id field is required"}"#.to_string(),
+    };
+
+    let ok = parsed["ok"].as_bool().unwrap_or(true);
+    let (status, body) = if ok {
+        let answer = parsed["answer"].as_str().unwrap_or("");
+        let references = parsed["references"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "id": id.clone(),
+                "answer": answer,
+                "references": references,
+            })
+            .to_string(),
+        )
+    } else {
+        let error = parsed["error"].as_str().unwrap_or("Failed to answer question");
+        (
+            500,
+            serde_json::json!({
+                "ok": false,
+                "id": id.clone(),
+                "error": error,
+            })
+            .to_string(),
+        )
+    };
+
+    match ASK_RESULTS.lock() {
+        Ok(mut results) => {
+            results.retain(|result| result.id != id);
+            results.push(AskResult { id, status, body });
+            while results.len() > 100 {
+                results.remove(0);
+            }
+            ASK_RESULTS_CVAR.notify_all();
+            r#"{"ok":true}"#.to_string()
+        }
+        Err(e) => format!(r#"{{"ok":false,"error":"Lock error: {}"}}"#, e),
+    }
+}
+
+fn remove_pending_ask(id: &str) {
+    if let Ok(mut pending) = PENDING_ASKS.lock() {
+        pending.retain(|ask| ask.id != id);
     }
 }
 
